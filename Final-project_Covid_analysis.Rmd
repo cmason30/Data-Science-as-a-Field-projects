@@ -1,0 +1,119 @@
+---
+title: "Final project - Covid Analysis by Colin Mason"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+```
+Question to explore: How did the trajectory of COVID-19 spread and severity change over time, and did these metrics differ significantly between California and Illinois?
+
+To answer our question, we first need to tidy the raw dataset. The original data is wid and cumulative. We pivot this data into a longer, tidy format and filter for our target states: California and Illinois. We also aggregate the county-level data to the state level and calculate the baseline rates per 100,000 people to account for the massive population differences between the two states.
+```{r}
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c("time_series_covid19_confirmed_global.csv", 
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_deaths_US.csv")
+urls <- str_c(url_in, file_names)
+
+us_confirmed     <- read_csv(urls[3], show_col_types = FALSE)
+us_deaths        <- read_csv(urls[4], show_col_types = FALSE)
+```
+
+```{r}
+us_confirmed_tidy <- us_confirmed %>%
+  pivot_longer(cols = -c(UID:Combined_Key), names_to = "date", values_to = "cases") %>%
+  mutate(date = mdy(date)) %>%
+  select(Admin2, Province_State, date, cases)
+
+us_deaths_tidy <- us_deaths %>%
+  pivot_longer(cols = -c(UID:Population), names_to = "date", values_to = "deaths") %>%
+  mutate(date = mdy(date)) %>%
+  select(Admin2, Province_State, date, deaths, Population)
+
+target_states <- c("California", "Illinois")
+
+state_comparison <- us_confirmed_tidy %>%
+  inner_join(us_deaths_tidy, by = c("Admin2", "Province_State", "date")) %>%
+  filter(Province_State %in% target_states,
+         !is.na(Admin2), 
+         Admin2 != "Unassigned", 
+         !str_detect(Admin2, "Out of"),
+         Population > 0) %>%
+  group_by(Province_State, date) %>%
+  summarize(cases = sum(cases), 
+            deaths = sum(deaths), 
+            Population = sum(Population), 
+            .groups = 'drop') %>%
+  filter(cases > 0) %>%
+  mutate(cases_per_100k = (cases / Population) * 100000,
+         deaths_per_100k = (deaths / Population) * 100000,
+         Province_State = as.factor(Province_State))
+
+summary(state_comparison)
+
+head(state_comparison)
+
+
+```
+Because the raw Johns Hopkins data provides cumulative totals, graphing it directly only shows an ever-increasing curve, which obscures the actual waves of the pandemic. To visualize the true spread, we must calculate the (new) cases by subtracting the previous day's total from the current day's total.
+
+We then aggregate these new cases by month and standardize them per 100,000 residents. Standardizing is a crucial statistical step, without it, California would almost always show higher counts simply because it has nearly three times the population of Illinois. The following heatmap visualizes the intensity of new monthly cases, allowing us to easily identify seasonal surges.
+
+```{r}
+state_comparison %>%
+  group_by(Province_State) %>%
+  mutate(new_cases = cases - lag(cases)) %>%
+  filter(new_cases >= 0) %>%
+  mutate(month = month(date, label = TRUE), year = year(date)) %>%
+  group_by(Province_State, year, month) %>%
+  summarize(monthly_cases_100k = (sum(new_cases) / max(Population)) * 100000, .groups = "drop") %>%
+  ggplot(aes(x = month, y = factor(year), fill = monthly_cases_100k)) +
+  geom_tile() +
+  facet_wrap(~Province_State, ncol = 1) +
+  labs(title = "Monthly Cases per 100k", x = "Month", y = "Year", fill = "Cases") +
+  theme_minimal()
+```
+While case counts tell us how fast the virus was spreading, they do not tell us how deadly it was. To measure severity, we calculate the Case Fatality Rate (CFR), defined as the number of new deaths divided by the number of new cases, expressed as a percentage.
+
+Early in the pandemic, testing capacity was severely limited, meaning only the sickest patients were tested. Additionally, states occasionally corrected their reporting backlogs, leading to days with "negative" new cases. To account for these reporting artifacts and focus on the true biological trajectory of the virus, we filter the data to only include months where the CFR is a plausible value between 0% and 10%. The resulting line plot tracks the lethality of the virus over time.
+
+```{r}
+cfr_data <- state_comparison %>%
+  group_by(Province_State) %>%
+  mutate(new_cases = cases - lag(cases), 
+         new_deaths = deaths - lag(deaths)) %>%
+  mutate(year_month = floor_date(date, "month")) %>%
+  group_by(Province_State, year_month) %>%
+  summarize(CFR_percent = (sum(new_deaths) / sum(new_cases)) * 100, .groups = "drop") %>%
+  filter(CFR_percent >= 0, CFR_percent < 10) # <--- STOP HERE (no pipe after this)
+
+ggplot(cfr_data, aes(x = year_month, y = CFR_percent, color = Province_State)) +
+  geom_line() +
+  labs(title = "Monthly Case Fatality Rate (%)", x = "Date", y = "CFR %") +
+  theme_minimal()
+```
+The model yields a highly significant, negative coefficient for the time index (p < 0.001). This indicates that as time progressed, the Case Fatality Rate steadily decreased. This aligns with real-world developments: over time, healthcare systems improved treatment protocols, vaccines were introduced, and the virus mutated into more transmissible but generally less lethal variants.
+
+When comparing the two states, the model uses California as the baseline. The coefficient for Illinois is -0.171, suggesting its CFR was slightly lower than California's on average. However, the p-value for this state variable is 0.554. Because this is well above the standard 0.05 threshold, we fail to reject the null hypothesis. We do not have sufficient evidence to conclude that there is a statistically significant difference in the overall Case Fatality Rate between California and Illinois when controlling for time.
+
+Potential Bias:
+
+As mentioned earlier, limited testing early in the pandemic meant mild and asymptomatic cases were severely undercounted, skewing the CFR higher.
+
+Deaths typically trail cases by two to four weeks. Because we aggregated our data strictly by calendar month, a surge in cases at the very end of one month might result in deaths that are counted in the following month, slightly skewing the monthly CFR ratio.
+
+Different states had different criteria for classifying a death as "due to COVID-19" versus "with COVID-19," and these definitions sometimes shifted over time. Furthermore, data dumps and weekend reporting delays introduce noise into the time-series.
+```{r}
+model_data <- cfr_data %>%
+  mutate(time_index = as.numeric(year_month))
+
+# Model: Does the Case Fatality Rate (CFR) change over time and by State?
+cfr_mod <- lm(CFR_percent ~ time_index + Province_State, data = model_data)
+
+# Show the model results
+summary(cfr_mod)
+```
