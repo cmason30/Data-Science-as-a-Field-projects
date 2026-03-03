@@ -1,0 +1,114 @@
+---
+title: "NYPD Shooting Incident Analysis"
+output:
+  html_document:
+    df_print: paged
+date: "2026-02-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load packages
+library(tidyverse)
+```
+
+```{r}
+# 1. Import NYPD shooting data
+
+nypd_url <- "https://data.cityofnewyork.us/api/views/98wc-x49t/rows.csv?accessType=DOWNLOAD"
+
+nypd_data <- read_csv(nypd_url)
+
+head(nypd_data)
+```
+
+```{r}
+# 2. Transform data
+
+nypd_data_cleaned <- nypd_data %>% 
+  select(INCIDENT_KEY, OCCUR_DATE, OCCUR_TIME, BORO, LOC_OF_OCCUR_DESC, PRECINCT, LOC_CLASSFCTN_DESC) %>% # Select relevant columns for analysis
+  mutate(
+    OCCUR_DATE = mdy(OCCUR_DATE), 
+    BORO = as.factor(BORO),     
+    PRECINCT = as.factor(PRECINCT),
+    LOC_OF_OCCUR_DESC = as.factor(LOC_OF_OCCUR_DESC),
+    LOC_CLASSFCTN_DESC = fct_na_value_to_level(as.factor(LOC_CLASSFCTN_DESC), level = "UNKNOWN"),    
+  )
+
+summary(nypd_data_cleaned)
+colSums(is.na(nypd_data_cleaned))
+  
+```
+
+OCCUR_DATE has been converted to date format
+BORO, PRECINCT, LOC_OF_OCCUR_DESC, LOC_CLASSFCTN_DESC all turned to factor. 
+LOCATION_DESC removed due to it being majority NaN, thus too sparse.  
+LOC_CLASSFCTN_DESC had some NaNs which were turned into "UNKNOWN" label. 
+
+
+```{r}
+# 3a. Add some visualizations to the NYPD cleaned data. 
+nypd_data_cleaned %>% 
+  ggplot(aes(x=BORO, fill=BORO)) + 
+  geom_bar() +
+  labs(title = "Total Shooting Incidents by Borough",
+       x = "Borough",
+       y = "Number of Incidents") + 
+  theme(legend.position = "none")
+
+
+
+```
+This bar graph shows us the boroughs by incident rate. Brooklyn is clearly the highest hovering close to 10,000 since 2006, while Staten Island appears much lower at less than 2,500 since 2006. Does brooklyn have the most shootings due to population density? 
+
+```{r}
+nypd_data_cleaned %>%
+  mutate(Year = year(OCCUR_DATE)) %>%
+  count(Year) %>%
+  ggplot(aes(x = Year, y = n)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point() +
+  labs(title = "Annual Shooting Incidents in NYC",
+       x = "Year",
+       y = "Total Incidents")
+
+
+```
+This graph shows us the trend of shooting incidents over time with a general decrease over time and spikes in 2020 and 2021. It'd be interesting to investigate more into why these outliers occured during those years (COVID-19, change in policy, or economic stressors, etc.)
+
+Questions: Why was there a spike in 202 and 2021? What would the trends look like if analyzed over month instead of year?
+
+```{r}
+# 3b. Poisson Regression Modeling of Shootings by Borough
+
+regression_data <- nypd_data_cleaned %>%
+  mutate(Year = year(OCCUR_DATE)) %>%
+  group_by(Year, BORO) %>%
+  summarize(Incident_Count = n(), .groups = 'drop')
+
+poisson_model <- glm(Incident_Count ~ BORO, 
+                     family = "poisson", 
+                     data = regression_data)
+
+summary(poisson_model)
+
+```
+Used a Poisson model and Bronx as a baseline borough to show that both Bronx and Brooklyn have the highest shooting rates. Manhattan, Queens, and Staten Island all have significantly lower shooting rates than the Bronx. Small p-value shows that the differences are statistically significant. 
+
+
+## 4. Conclusion and Bias
+
+After cleaning and looking at the NYPD shooting data, a few things stand out to me. First, was the huge undeiable spike in 2020 and 2021. Second, location does seem to matter; the bar chart and my poisson model show that places like Brooklyn and the Bronx show much more shootings than other boroughs. So if you are worried about safety, make sure to live in Staten Island. 
+
+Sources of Bias
+
+1. The data is only shootings that NYPD might be aware of. Some areas might be recorded at a lower rate. For example, I had to drop LOCATION_DESC as a column due to many NaN values, but if those were all filled, I might have more insight as to what kinds of locations shootings happen at. 
+
+2. For my analysis, I only looked at variables like Borough and Year. A good model likely requires more variables like population density or poverty levels. For example, Brooklyn has the most shootings, but its also likely the most population dense. Without these missing variables, my analysis might actually make Brooklyn worse than on a per-person basis. 
+
+To overcome some biases, I ran a Poisson regression to make sure differences in boroughs were statistically significant. I also made sure to run my time series visualization on the full twenty year window and not a subset of the history. 
+
+
